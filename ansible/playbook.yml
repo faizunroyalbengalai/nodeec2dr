@@ -248,10 +248,10 @@
         app:latest
 
     # ── Verify deployment ─────────────────────────────────────────────────────
-    - name: Wait for app to be reachable on port 3000
+    - name: Wait for app to be reachable on port 80
       wait_for:
         host: 127.0.0.1
-        port: 3000
+        port: 80
         delay: 10
         timeout: 120
         state: started
@@ -272,7 +272,7 @@
     - name: Fail if app did not start
       fail:
         msg: >
-          App did not start on port 3000 within 120 seconds.
+          App did not start on port 80 within 120 seconds.
           Check the Docker logs above. Common causes: missing build step,
           crashed entrypoint, or mismatched port.
       when: port_wait is failed
