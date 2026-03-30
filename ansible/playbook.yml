@@ -1,0 +1,290 @@
+---
+- name: Deploy node in Docker on EC2
+  hosts: all
+  become: yes
+  vars:
+    app_dir: /opt/app
+    ansible_user: ubuntu
+    node_env_database_url: "{{ node_env_database_url | default('') }}"
+    node_env_mongo_uri: "{{ node_env_mongo_uri | default('') }}"
+    node_env_db_host: "{{ node_env_db_host | default('') }}"
+    node_env_db_port: "{{ node_env_db_port | default('') }}"
+    node_env_db_name: "{{ node_env_db_name | default('') }}"
+    node_env_db_user: "{{ node_env_db_user | default('') }}"
+    node_env_db_password: "{{ node_env_db_password | default('') }}"
+    install_db: "{{ install_db | default('') }}"
+    db_type: "{{ db_type | default('') }}"
+    db_name: "{{ db_name | default('') }}"
+    db_username: "{{ db_username | default('') }}"
+    db_password: "{{ db_password | default('') }}"
+
+  tasks:
+
+    # ── Install PostgreSQL if requested ──────────────────────────────────────
+    - name: Install PostgreSQL
+      when: install_db | lower == 'true' and db_type | lower == 'postgres'
+      block:
+        - name: Install PostgreSQL packages
+          apt:
+            name: [postgresql, postgresql-contrib]
+            state: present
+            update_cache: yes
+
+        - name: Start and enable PostgreSQL
+          service:
+            name: postgresql
+            state: started
+            enabled: yes
+
+        - name: Set pg_hba to md5 auth
+          shell: |
+            PG_HBA=$(find /etc/postgresql -name pg_hba.conf | head -1)
+            sed -i 's/^local\s\+all\s\+all\s\+peer/local all all md5/' "$PG_HBA"
+            sed -i 's/^host\s\+all\s\+all\s\+127.0.0.1\/32\s\+ident/host all all 127.0.0.1\/32 md5/' "$PG_HBA"
+            sed -i 's/^host\s\+all\s\+all\s\+::1\/128\s\+ident/host all all ::1\/128 md5/' "$PG_HBA"
+          args:
+            executable: /bin/bash
+
+        - name: Reload PostgreSQL
+          service:
+            name: postgresql
+            state: reloaded
+
+        - name: Create PostgreSQL database and user
+          shell: |
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ db_username }}'" | grep -q 1 || \
+              sudo -u postgres psql -c "CREATE USER {{ db_username }} WITH PASSWORD '{{ db_password }}';"
+            sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'" | grep -q 1 || \
+              sudo -u postgres psql -c "CREATE DATABASE {{ db_name }} OWNER {{ db_username }};"
+            sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE {{ db_name }} TO {{ db_username }};"
+          args:
+            executable: /bin/bash
+
+    # ── Install MySQL if requested ────────────────────────────────────────────
+    - name: Install MySQL
+      when: install_db | lower == 'true' and db_type | lower == 'mysql'
+      block:
+        - name: Install MySQL packages
+          apt:
+            name: [mysql-server, mysql-client]
+            state: present
+            update_cache: yes
+
+        - name: Start and enable MySQL
+          service:
+            name: mysql
+            state: started
+            enabled: yes
+
+        - name: Create MySQL database and user
+          shell: |
+            mysql -u root -e "CREATE DATABASE IF NOT EXISTS {{ db_name }};"
+            mysql -u root -e "CREATE USER IF NOT EXISTS '{{ db_username }}'@'%' IDENTIFIED BY '{{ db_password }}';"
+            mysql -u root -e "GRANT ALL PRIVILEGES ON {{ db_name }}.* TO '{{ db_username }}'@'%';"
+            mysql -u root -e "FLUSH PRIVILEGES;"
+          args:
+            executable: /bin/bash
+
+    # ── Install MongoDB if requested ──────────────────────────────────────────
+    - name: Install MongoDB
+      when: install_db | lower == 'true' and db_type | lower == 'mongodb'
+      block:
+        - name: Add MongoDB GPG key
+          apt_key:
+            url: https://www.mongodb.org/static/pgp/server-7.0.asc
+            state: present
+
+        - name: Add MongoDB repo
+          apt_repository:
+            repo: "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse"
+            state: present
+
+        - name: Install MongoDB
+          apt:
+            name: mongodb-org
+            state: present
+            update_cache: yes
+
+        - name: Start and enable MongoDB
+          service:
+            name: mongod
+            state: started
+            enabled: yes
+
+        - name: Init MongoDB database
+          shell: |
+            mongosh --quiet --eval "
+              use {{ db_name }};
+              db.createUser({
+                user: '{{ db_username }}',
+                pwd: '{{ db_password }}',
+                roles: [{ role: 'readWrite', db: '{{ db_name }}' }]
+              });
+            " || true
+          args:
+            executable: /bin/bash
+
+    # ── Docker installation ───────────────────────────────────────────────────
+    - name: Install dependencies for Docker
+      apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg, lsb-release]
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name: [docker-ce, docker-ce-cli, containerd.io]
+        state: present
+        update_cache: yes
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Reset SSH connection so docker group takes effect
+      meta: reset_connection
+
+    # ── App directory ─────────────────────────────────────────────────────────
+    - name: Wipe old app directory
+      file:
+        path: "{{ app_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Recreate app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Copy all project files to server
+      copy:
+        src: ../
+        dest: "{{ app_dir }}/"
+        mode: '0755'
+
+    # ── Write Dockerfile if not present ──────────────────────────────────────
+    - name: Check if Dockerfile exists
+      stat:
+        path: "{{ app_dir }}/Dockerfile"
+      register: dockerfile_stat
+
+    - name: Write default Dockerfile for Node 24
+      copy:
+        dest: "{{ app_dir }}/Dockerfile"
+        mode: '0644'
+        content: |
+          FROM node:24-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm install
+          COPY . .
+          RUN if grep -q '"build"' package.json; then npm run build; fi
+          EXPOSE 3000
+          CMD ["npm", "start"]
+      when: not dockerfile_stat.stat.exists
+
+    # ── Write .env file ───────────────────────────────────────────────────────
+    - name: Write .env file on server
+      copy:
+        dest: "{{ app_dir }}/.env"
+        mode: '0600'
+        content: |
+          NODE_ENV=production
+          PORT=3000
+          HOST=0.0.0.0
+          {% if node_env_database_url %}DATABASE_URL={{ node_env_database_url }}{% endif %}
+
+          {% if node_env_mongo_uri %}MONGO_URI={{ node_env_mongo_uri }}{% endif %}
+
+          {% if node_env_db_host %}DB_HOST={{ node_env_db_host }}{% endif %}
+
+          {% if node_env_db_port %}DB_PORT={{ node_env_db_port }}{% endif %}
+
+          {% if node_env_db_name %}DB_NAME={{ node_env_db_name }}{% endif %}
+
+          {% if node_env_db_user %}DB_USER={{ node_env_db_user }}{% endif %}
+
+          {% if node_env_db_password %}DB_PASSWORD={{ node_env_db_password }}{% endif %}
+
+    # ── Build and run Docker container ────────────────────────────────────────
+    - name: Stop existing container
+      shell: docker stop app || true
+
+    - name: Remove existing container
+      shell: docker rm app || true
+
+    - name: Remove old image to force rebuild
+      shell: docker rmi app:latest || true
+
+    - name: Build Docker image
+      shell: docker build --no-cache -t app:latest {{ app_dir }}/
+
+    - name: Run Docker container
+      shell: >
+        docker run -d
+        --name app
+        -p 80:3000
+        --restart always
+        --env-file {{ app_dir }}/.env
+        app:latest
+
+    # ── Verify deployment ─────────────────────────────────────────────────────
+    - name: Wait for app to be reachable on port 3000
+      wait_for:
+        host: 127.0.0.1
+        port: 3000
+        delay: 10
+        timeout: 120
+        state: started
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Print Docker logs if app did not start
+      shell: docker logs --tail 100 app
+      register: docker_logs
+      when: port_wait is failed
+      changed_when: false
+
+    - name: Show Docker logs
+      debug:
+        msg: "{{ docker_logs.stdout_lines | default(['No logs captured']) }}"
+      when: port_wait is failed
+
+    - name: Fail if app did not start
+      fail:
+        msg: >
+          App did not start on port 3000 within 120 seconds.
+          Check the Docker logs above. Common causes: missing build step,
+          crashed entrypoint, or mismatched port.
+      when: port_wait is failed
+
+    - name: Verify container is running
+      shell: docker ps --filter name=app --filter status=running --format '{{ '{{' }}.Names{{ '}}' }}'
+      register: container_check
+      retries: 3
+      delay: 5
+      until: container_check.stdout != ""
+      become: yes
+
+    - name: Report server IP
+      debug:
+        msg: "server_ip={{ ansible_host }}"
